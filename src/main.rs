@@ -1,63 +1,42 @@
-use clap::Parser;
-use jit::{Lexer, Op, OpKind, Ops};
-use std::{fs, io, path::PathBuf};
-
 mod jit;
 
-#[derive(Debug, Parser)]
-#[clap(version)]
-struct Opt {
-    #[clap(name = "FILE")]
-    file_path: PathBuf,
-    // #[clap(long = "no-jit", help = "Disable JIT compilation")]
-    // no_jit: bool,
-}
+fn main() -> Result<(), String> {
+    let args: Vec<String> = std::env::args().collect();
+    let program = &args[0];
 
-fn main() -> io::Result<()> {
-    let opt = Opt::parse();
-    let content = fs::read_to_string(&opt.file_path)?;
-    let mut lexer = Lexer::new(content.as_bytes());
-    let mut ops = Ops::new();
+    let mut no_jit = false;
+    let mut file_path = None;
 
-    while let Some(ch) = lexer.next() {
-        let current_op_kind = match ch {
-            b'+' => OpKind::Inc,
-            b'-' => OpKind::Dec,
-            b'<' => OpKind::Left,
-            b'>' => OpKind::Right,
-            b'.' => OpKind::Output,
-            b',' => OpKind::Input,
-            b'[' => OpKind::JumpIfZero,
-            b']' => OpKind::JumpIfNonZero,
-            _ => continue,
-        };
-
-        if let Some(last_op) = ops.items.last_mut() {
-            if last_op.kind == current_op_kind {
-                last_op.operand += 1;
-                continue;
+    for arg in &args[1..] {
+        if arg == "--no-jit" {
+            no_jit = true;
+        } else {
+            if file_path.is_some() {
+                eprintln!("Usage: {} [--no-jit] <input.bf>", program);
+                eprintln!("Providing several files is not supported");
+                return Err("Invalid arguments".to_string());
             }
+            file_path = Some(arg);
         }
-
-        let new_op = Op {
-            kind: current_op_kind,
-            operand: 1,
-        };
-
-        ops.push(new_op);
     }
 
-    for op in ops.items.iter() {
-        let kind_char = Into::<u8>::into(op.kind) as char;
-        println!("OpKind: {}, Operand: {}", kind_char, op.operand);
-    }
+    let file_path = file_path.ok_or_else(|| {
+        eprintln!("Usage: {} [--no-jit] <input.bf>", program);
+        "No input is provided".to_string()
+    })?;
 
-    if !jit::interpret(ops) {
-        eprintln!("Failed to interpret operations");
-        return Err(io::Error::new(
-            io::ErrorKind::Other,
-            "Interpretation failed",
-        ));
+    let ops = jit::generate_ops(file_path)?;
+
+    if no_jit {
+        println!("JIT: off");
+        jit::interpret(&ops)?;
+    } else {
+        println!("JIT: on");
+        let code = jit::jit_compile(&ops)?;
+        let mut memory = vec![0u8; jit::JIT_MEMORY_CAP];
+        unsafe {
+            (code.run)(memory.as_mut_ptr());
+        }
     }
 
     Ok(())
