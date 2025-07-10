@@ -1,4 +1,4 @@
-use libc::{mmap, munmap, MAP_ANONYMOUS, MAP_PRIVATE, PROT_EXEC, PROT_READ, PROT_WRITE};
+use libc::{MAP_ANONYMOUS, MAP_PRIVATE, PROT_EXEC, PROT_READ, PROT_WRITE, mmap, munmap};
 use std::{
     error::Error,
     fmt, fs,
@@ -214,7 +214,9 @@ pub struct JitCode {
 
 impl JitCode {
     pub unsafe fn execute(&self, memory_ptr: *mut u8) {
-        (self.run)(memory_ptr);
+        unsafe {
+            (self.run)(memory_ptr);
+        }
     }
 }
 

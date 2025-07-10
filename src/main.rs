@@ -12,7 +12,6 @@ fn main() {
 fn run() -> Result<(), jit::BfError> {
     let args: Vec<String> = env::args().collect();
     let program = args.get(0).map(|s| s.as_str()).unwrap_or("bfjit");
-
     let (no_jit, file_path) = parse_args(program, &args[1..])?;
 
     if no_jit {
@@ -30,6 +29,7 @@ fn execute_jit(file_path: String) -> Result<(), jit::BfError> {
     unsafe {
         code.execute(memory.as_mut_ptr());
     }
+    
     Ok(())
 }
 
