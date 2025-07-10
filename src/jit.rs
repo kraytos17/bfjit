@@ -1,13 +1,61 @@
 use libc::{mmap, munmap, MAP_ANONYMOUS, MAP_PRIVATE, PROT_EXEC, PROT_READ, PROT_WRITE};
-use std::fs;
-use std::io::{self, Read, Write};
-use std::mem;
-use std::ptr;
+use std::{
+    error::Error,
+    fmt, fs,
+    io::{self, Read, Write},
+    mem,
+    path::Path,
+    ptr,
+};
 
 pub const JIT_MEMORY_CAP: usize = 10 * 1000 * 1000;
+const SYSCALL_READ: u8 = 0x00;
+const SYSCALL_WRITE: u8 = 0x01;
+const FD_STDIN: u8 = 0x00;
+const FD_STDOUT: u8 = 0x01;
+
+#[derive(Debug)]
+pub enum BfError {
+    Io(io::Error),
+    Parse {
+        file: String,
+        pos: usize,
+        message: String,
+    },
+    Runtime(String),
+    Jit(String),
+    InvalidOpcode {
+        opcode: char,
+        pos: usize,
+    },
+}
+
+impl fmt::Display for BfError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            BfError::Io(e) => write!(f, "IO error: {}", e),
+            BfError::Parse { file, pos, message } => {
+                write!(f, "{} [{}]: Parse error: {}", file, pos, message)
+            }
+            BfError::Runtime(msg) => write!(f, "Runtime error: {}", msg),
+            BfError::Jit(msg) => write!(f, "JIT error: {}", msg),
+            BfError::InvalidOpcode { opcode, pos } => {
+                write!(f, "Invalid opcode '{}' at position {}", opcode, pos)
+            }
+        }
+    }
+}
+
+impl Error for BfError {}
+
+impl From<io::Error> for BfError {
+    fn from(err: io::Error) -> Self {
+        BfError::Io(err)
+    }
+}
 
 #[repr(u8)]
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpKind {
     Inc = b'+',
     Dec = b'-',
@@ -19,13 +67,39 @@ pub enum OpKind {
     JumpIfNonZero = b']',
 }
 
+impl OpKind {
+    #[inline]
+    fn is_foldable_byte(byte: u8) -> bool {
+        matches!(byte, b'+' | b'-' | b'<' | b'>' | b'.' | b',')
+    }
+}
+
+impl TryFrom<u8> for OpKind {
+    type Error = BfError;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            b'+' => Ok(OpKind::Inc),
+            b'-' => Ok(OpKind::Dec),
+            b'<' => Ok(OpKind::Left),
+            b'>' => Ok(OpKind::Right),
+            b'.' => Ok(OpKind::Output),
+            b',' => Ok(OpKind::Input),
+            b'[' => Ok(OpKind::JumpIfZero),
+            b']' => Ok(OpKind::JumpIfNonZero),
+            _ => Err(BfError::InvalidOpcode {
+                opcode: value as char,
+                pos: 0,
+            }),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Op {
     kind: OpKind,
     operand: usize,
 }
-
-pub type Ops = Vec<Op>;
 
 pub struct Lexer<'a> {
     content: &'a [u8],
@@ -33,102 +107,118 @@ pub struct Lexer<'a> {
 }
 
 impl<'a> Lexer<'a> {
-    fn new(content: &'a [u8]) -> Self {
+    pub fn new(content: &'a [u8]) -> Self {
         Lexer { content, pos: 0 }
     }
 
-    fn next(&mut self) -> Option<u8> {
-        while self.pos < self.content.len() && !is_bf_cmd(self.content[self.pos]) {
+    pub fn next(&mut self) -> Option<u8> {
+        self.content.get(self.pos).copied().map(|ch| {
             self.pos += 1;
-        }
-        if self.pos >= self.content.len() {
-            None
-        } else {
-            let ch = self.content[self.pos];
-            self.pos += 1;
-            Some(ch)
-        }
+            ch
+        })
+    }
+
+    pub fn peek(&self) -> Option<u8> {
+        self.content.get(self.pos).copied()
+    }
+
+    pub fn position(&self) -> usize {
+        self.pos
     }
 }
 
-fn is_bf_cmd(ch: u8) -> bool {
-    b"+-<>,.[]".contains(&ch)
+pub struct Interpreter {
+    memory: Vec<u8>,
+    head: usize,
 }
 
-pub fn interpret(ops: &Ops) -> Result<(), String> {
-    let mut memory = vec![0u8; 1];
-    let mut head = 0;
-    let mut ip = 0;
+impl Interpreter {
+    pub fn new() -> Self {
+        let mut memory = Vec::with_capacity(30_000);
+        memory.push(0);
+        Self { memory, head: 0 }
+    }
 
-    while ip < ops.len() {
-        let op = &ops[ip];
-        match op.kind {
-            OpKind::Inc => {
-                memory[head] = memory[head].wrapping_add(op.operand as u8);
-                ip += 1;
-            }
-            OpKind::Dec => {
-                memory[head] = memory[head].wrapping_sub(op.operand as u8);
-                ip += 1;
-            }
-            OpKind::Left => {
-                if head < op.operand {
-                    return Err("RUNTIME ERROR: Memory underflow".to_string());
-                }
-                head -= op.operand;
-                ip += 1;
-            }
-            OpKind::Right => {
-                head += op.operand;
-                while head >= memory.len() {
-                    memory.push(0);
-                }
-                ip += 1;
-            }
-            OpKind::Input => {
-                for _ in 0..op.operand {
-                    let mut input = [0u8; 1];
-                    io::stdin()
-                        .read_exact(&mut input)
-                        .map_err(|e| e.to_string())?;
-                    memory[head] = input[0];
-                }
-                ip += 1;
-            }
-            OpKind::Output => {
-                for _ in 0..op.operand {
-                    io::stdout()
-                        .write_all(&[memory[head]])
-                        .map_err(|e| e.to_string())?;
-                }
-                ip += 1;
-            }
-            OpKind::JumpIfZero => {
-                if memory[head] == 0 {
-                    ip = op.operand;
-                } else {
+    pub fn interpret(&mut self, ops: &[Op]) -> Result<(), BfError> {
+        let stdin = io::stdin();
+        let mut stdin_lock = stdin.lock();
+        let stdout = io::stdout();
+        let mut stdout_lock = stdout.lock();
+
+        let mut ip = 0;
+        while ip < ops.len() {
+            let op = &ops[ip];
+            match op.kind {
+                OpKind::Inc => {
+                    self.memory[self.head] = self.memory[self.head].wrapping_add(op.operand as u8);
                     ip += 1;
                 }
-            }
-            OpKind::JumpIfNonZero => {
-                if memory[head] != 0 {
-                    ip = op.operand;
-                } else {
+                OpKind::Dec => {
+                    self.memory[self.head] = self.memory[self.head].wrapping_sub(op.operand as u8);
                     ip += 1;
+                }
+                OpKind::Left => {
+                    if self.head < op.operand {
+                        return Err(BfError::Runtime("Memory underflow".to_string()));
+                    }
+                    self.head -= op.operand;
+                    ip += 1;
+                }
+                OpKind::Right => {
+                    self.head += op.operand;
+                    while self.head >= self.memory.len() {
+                        self.memory.push(0);
+                    }
+                    ip += 1;
+                }
+                OpKind::Input => {
+                    for _ in 0..op.operand {
+                        let mut input = [0u8; 1];
+                        stdin_lock.read_exact(&mut input)?;
+                        self.memory[self.head] = input[0];
+                    }
+                    ip += 1;
+                }
+                OpKind::Output => {
+                    for _ in 0..op.operand {
+                        stdout_lock.write_all(&[self.memory[self.head]])?;
+                    }
+                    ip += 1;
+                }
+                OpKind::JumpIfZero => {
+                    ip = if self.memory[self.head] == 0 {
+                        op.operand
+                    } else {
+                        ip + 1
+                    };
+                }
+                OpKind::JumpIfNonZero => {
+                    ip = if self.memory[self.head] == 0 {
+                        ip + 1
+                    } else {
+                        op.operand
+                    };
                 }
             }
         }
-    }
 
-    Ok(())
+        stdout_lock.flush()?;
+        Ok(())
+    }
 }
 
-pub struct Code {
-    pub run: unsafe fn(*mut u8),
+pub struct JitCode {
+    run: unsafe fn(*mut u8),
     len: usize,
 }
 
-impl Drop for Code {
+impl JitCode {
+    pub unsafe fn execute(&self, memory_ptr: *mut u8) {
+        (self.run)(memory_ptr);
+    }
+}
+
+impl Drop for JitCode {
     fn drop(&mut self) {
         unsafe {
             munmap(self.run as *mut _, self.len);
@@ -136,175 +226,224 @@ impl Drop for Code {
     }
 }
 
-struct Backpatch {
-    operand_byte_addr: usize,
-    src_byte_addr: usize,
-    dst_op_index: usize,
-}
+pub struct JitCompiler;
 
-pub fn jit_compile(ops: &Ops) -> Result<Code, String> {
-    let mut sb = Vec::new();
-    let mut backpatches = Vec::new();
-    let mut addrs = Vec::new();
+impl JitCompiler {
+    pub fn compile(ops: &[Op]) -> Result<JitCode, BfError> {
+        let mut code_buffer = Vec::with_capacity(ops.len() * 32);
+        let mut backpatches = Vec::with_capacity(64);
+        let mut instruction_addresses = Vec::with_capacity(ops.len() + 1);
 
-    for op in ops.iter() {
-        addrs.push(sb.len());
+        for op in ops {
+            instruction_addresses.push(code_buffer.len());
+            Self::emit_instruction(op, &mut code_buffer, &mut backpatches)?;
+        }
+        instruction_addresses.push(code_buffer.len());
+
+        Self::apply_backpatches(&mut code_buffer, &backpatches, &instruction_addresses);
+        code_buffer.push(0xC3); // RET
+
+        let executable_memory = Self::allocate_executable_memory(&code_buffer)?;
+
+        Ok(JitCode {
+            run: unsafe { mem::transmute(executable_memory) },
+            len: code_buffer.len(),
+        })
+    }
+
+    fn emit_instruction(
+        op: &Op,
+        buffer: &mut Vec<u8>,
+        backpatches: &mut Vec<Backpatch>,
+    ) -> Result<(), BfError> {
         match op.kind {
             OpKind::Inc => {
-                assert!(op.operand < 256, "TODO: support bigger operands");
-                sb.extend_from_slice(&[0x80, 0x07]);
-                sb.push(op.operand as u8);
+                if op.operand >= 256 {
+                    return Err(BfError::Jit("Operand too large for INC".to_string()));
+                }
+                buffer.extend_from_slice(&[0x80, 0x07]);
+                buffer.push(op.operand as u8);
             }
             OpKind::Dec => {
-                assert!(op.operand < 256, "TODO: support bigger operands");
-                sb.extend_from_slice(&[0x80, 0x2f]);
-                sb.push(op.operand as u8);
+                if op.operand >= 256 {
+                    return Err(BfError::Jit("Operand too large for DEC".to_string()));
+                }
+                buffer.extend_from_slice(&[0x80, 0x2F]);
+                buffer.push(op.operand as u8);
             }
             OpKind::Left => {
-                sb.extend_from_slice(&[0x48, 0x81, 0xef]);
-                sb.extend_from_slice(&(op.operand as u32).to_le_bytes());
+                buffer.extend_from_slice(&[0x48, 0x81, 0xEF]);
+                buffer.extend_from_slice(&(op.operand as u32).to_le_bytes());
             }
             OpKind::Right => {
-                sb.extend_from_slice(&[0x48, 0x81, 0xc7]);
-                sb.extend_from_slice(&(op.operand as u32).to_le_bytes());
+                buffer.extend_from_slice(&[0x48, 0x81, 0xC7]);
+                buffer.extend_from_slice(&(op.operand as u32).to_le_bytes());
             }
             OpKind::Output => {
                 for _ in 0..op.operand {
-                    sb.extend_from_slice(&[
-                        0x57, 0x48, 0xc7, 0xc0, 0x01, 0x00, 0x00, 0x00, 0x48, 0x89, 0xfe, 0x48,
-                        0xc7, 0xc7, 0x01, 0x00, 0x00, 0x00, 0x48, 0xc7, 0xc2, 0x01, 0x00, 0x00,
-                        0x00, 0x0f, 0x05, 0x5f,
-                    ]);
+                    Self::emit_syscall(buffer, SYSCALL_WRITE, FD_STDOUT);
                 }
             }
             OpKind::Input => {
                 for _ in 0..op.operand {
-                    sb.extend_from_slice(&[
-                        0x57, 0x48, 0xc7, 0xc0, 0x00, 0x00, 0x00, 0x00, 0x48, 0x89, 0xfe, 0x48,
-                        0xc7, 0xc7, 0x00, 0x00, 0x00, 0x00, 0x48, 0xc7, 0xc2, 0x01, 0x00, 0x00,
-                        0x00, 0x0f, 0x05, 0x5f,
-                    ]);
+                    Self::emit_syscall(buffer, SYSCALL_READ, FD_STDIN);
                 }
             }
             OpKind::JumpIfZero => {
-                sb.extend_from_slice(&[0x8a, 0x07, 0x84, 0xc0, 0x0f, 0x84]);
-                let operand_byte_addr = sb.len();
-                sb.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
-                let src_byte_addr = sb.len();
+                buffer.extend_from_slice(&[0x8A, 0x07, 0x84, 0xC0, 0x0F, 0x84]);
+                let operand_addr = buffer.len();
+                buffer.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
                 backpatches.push(Backpatch {
-                    operand_byte_addr,
-                    src_byte_addr,
-                    dst_op_index: op.operand,
+                    operand_addr,
+                    src_addr: buffer.len(),
+                    target_idx: op.operand,
                 });
             }
             OpKind::JumpIfNonZero => {
-                sb.extend_from_slice(&[0x8a, 0x07, 0x84, 0xc0, 0x0f, 0x85]);
-                let operand_byte_addr = sb.len();
-                sb.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
-                let src_byte_addr = sb.len();
+                buffer.extend_from_slice(&[0x8A, 0x07, 0x84, 0xC0, 0x0F, 0x85]);
+                let operand_addr = buffer.len();
+                buffer.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
                 backpatches.push(Backpatch {
-                    operand_byte_addr,
-                    src_byte_addr,
-                    dst_op_index: op.operand,
+                    operand_addr,
+                    src_addr: buffer.len(),
+                    target_idx: op.operand,
                 });
             }
         }
-    }
-    addrs.push(sb.len());
-
-    for bp in &backpatches {
-        let src_addr = bp.src_byte_addr as i32;
-        let dst_addr = addrs[bp.dst_op_index] as i32;
-        let operand = dst_addr - src_addr;
-        sb[bp.operand_byte_addr..bp.operand_byte_addr + 4].copy_from_slice(&operand.to_le_bytes());
+        Ok(())
     }
 
-    sb.push(0xC3);
-
-    let code_len = sb.len();
-    let code_ptr = unsafe {
-        mmap(
-            ptr::null_mut(),
-            code_len,
-            PROT_EXEC | PROT_READ | PROT_WRITE,
-            MAP_PRIVATE | MAP_ANONYMOUS,
-            -1,
-            0,
-        )
-    };
-
-    if code_ptr == libc::MAP_FAILED {
-        return Err(format!(
-            "Could not allocate executable memory: {}",
-            io::Error::last_os_error()
-        ));
+    fn emit_syscall(buffer: &mut Vec<u8>, syscall: u8, fd: u8) {
+        buffer.extend_from_slice(&[
+            0x57, // push rdi
+            0x48, 0xC7, 0xC0, syscall, 0x00, 0x00, 0x00, // mov rax, syscall
+            0x48, 0x89, 0xFE, // mov rsi, rdi
+            0x48, 0xC7, 0xC7, fd, 0x00, 0x00, 0x00, // mov rdi, fd
+            0x48, 0xC7, 0xC2, 0x01, 0x00, 0x00, 0x00, // mov rdx, 1
+            0x0F, 0x05, // syscall
+            0x5F, // pop rdi
+        ]);
     }
 
-    unsafe {
-        ptr::copy_nonoverlapping(sb.as_ptr(), code_ptr as *mut u8, code_len);
+    fn apply_backpatches(
+        buffer: &mut Vec<u8>,
+        backpatches: &[Backpatch],
+        instruction_addresses: &[usize],
+    ) {
+        for bp in backpatches {
+            let src_addr = bp.src_addr as i32;
+            let target_addr = instruction_addresses[bp.target_idx] as i32;
+            let offset = target_addr - src_addr;
+            buffer[bp.operand_addr..bp.operand_addr + 4].copy_from_slice(&offset.to_le_bytes());
+        }
     }
 
-    Ok(Code {
-        run: unsafe { mem::transmute::<*mut libc::c_void, unsafe fn(*mut u8)>(code_ptr) },
-        len: code_len,
-    })
+    fn allocate_executable_memory(code: &[u8]) -> Result<*mut libc::c_void, BfError> {
+        let ptr = unsafe {
+            mmap(
+                ptr::null_mut(),
+                code.len(),
+                PROT_READ | PROT_WRITE | PROT_EXEC,
+                MAP_PRIVATE | MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+
+        if ptr == libc::MAP_FAILED {
+            return Err(BfError::Jit(format!(
+                "Failed to allocate executable memory: {}",
+                io::Error::last_os_error()
+            )));
+        }
+
+        unsafe {
+            ptr::copy_nonoverlapping(code.as_ptr(), ptr as *mut u8, code.len());
+        }
+
+        Ok(ptr)
+    }
 }
 
-pub fn generate_ops(file_path: &str) -> Result<Ops, String> {
-    let content = fs::read(file_path).map_err(|e| e.to_string())?;
-    let mut lexer = Lexer::new(&content);
-    let mut ops = Vec::new();
-    let mut stack = Vec::new();
+struct Backpatch {
+    operand_addr: usize,
+    src_addr: usize,
+    target_idx: usize,
+}
 
-    while let Some(c) = lexer.next() {
-        match c {
-            b'.' | b',' | b'<' | b'>' | b'-' | b'+' => {
+pub struct Parser;
+
+impl Parser {
+    pub fn parse_file<P: AsRef<Path>>(path: P) -> Result<Vec<Op>, BfError> {
+        let content = fs::read(path.as_ref())?;
+        Self::parse_bytes(&content, path.as_ref().to_string_lossy().into_owned())
+    }
+
+    pub fn parse_bytes(content: &[u8], source_name: String) -> Result<Vec<Op>, BfError> {
+        let mut lexer = Lexer::new(content);
+        let mut ops = Vec::with_capacity(content.len());
+        let mut loop_stack = Vec::new();
+
+        while let Some(c) = lexer.next() {
+            if OpKind::is_foldable_byte(c) {
+                let kind = OpKind::try_from(c).map_err(|_| BfError::InvalidOpcode {
+                    opcode: c as char,
+                    pos: lexer.position(),
+                })?;
+
                 let mut count = 1;
-                while let Some(s) = lexer.next() {
-                    if s == c {
-                        count += 1;
-                    } else {
-                        lexer.pos -= 1;
-                        break;
-                    }
+                while lexer.peek() == Some(c) {
+                    count += 1;
+                    lexer.next();
                 }
+
                 ops.push(Op {
-                    kind: unsafe { mem::transmute::<u8, OpKind>(c) },
+                    kind,
                     operand: count,
                 });
-            }
-            b'[' => {
+            } else if c == b'[' {
                 let addr = ops.len();
                 ops.push(Op {
                     kind: OpKind::JumpIfZero,
-                    operand: 0,
+                    operand: 0, // Will be patched later
                 });
-                stack.push(addr);
-            }
-            b']' => {
-                if let Some(addr) = stack.pop() {
+                loop_stack.push(addr);
+            } else if c == b']' {
+                if let Some(start_addr) = loop_stack.pop() {
                     ops.push(Op {
                         kind: OpKind::JumpIfNonZero,
-                        operand: addr + 1,
+                        operand: start_addr,
                     });
-                    ops[addr].operand = ops.len();
+                    ops[start_addr].operand = ops.len();
                 } else {
-                    return Err(format!(
-                        "{} [{}]: ERROR: Unbalanced loop",
-                        file_path, lexer.pos
-                    ));
+                    return Err(BfError::Parse {
+                        file: source_name,
+                        pos: lexer.position(),
+                        message: "Unmatched closing bracket".to_string(),
+                    });
                 }
             }
-            _ => {}
         }
-    }
 
-    if !stack.is_empty() {
-        return Err(format!(
-            "{} [{}]: ERROR: Unbalanced loop",
-            file_path, lexer.pos
-        ));
-    }
+        if !loop_stack.is_empty() {
+            return Err(BfError::Parse {
+                file: source_name,
+                pos: lexer.position(),
+                message: "Unmatched opening bracket".to_string(),
+            });
+        }
 
-    Ok(ops)
+        Ok(ops)
+    }
+}
+
+pub fn interpret_file<P: AsRef<Path>>(path: P) -> Result<(), BfError> {
+    let ops = Parser::parse_file(path)?;
+    let mut interpreter = Interpreter::new();
+    interpreter.interpret(&ops)
+}
+
+pub fn jit_compile_file<P: AsRef<Path>>(path: P) -> Result<JitCode, BfError> {
+    let ops = Parser::parse_file(path)?;
+    JitCompiler::compile(&ops)
 }
