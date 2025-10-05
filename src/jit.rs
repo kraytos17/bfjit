@@ -22,7 +22,6 @@ use std::{
 
 /// Maximum amount of memory (in bytes) that can be allocated for JIT compilation
 pub const JIT_MEMORY_CAP: usize = 10 * 1000 * 1000;
-
 /// System call number for read operations
 const SYSCALL_READ: u8 = 0x00;
 /// System call number for write operations
@@ -213,34 +212,50 @@ impl Interpreter {
         let mut ip = 0; // Instruction pointer
         while ip < ops.len() {
             let op = &ops[ip];
-            match op.kind {
+            ip = match op.kind {
                 OpKind::Inc => {
                     // Increment the current memory cell, with wrapping arithmetic
-                    self.memory[self.head] =
-                        self.memory[self.head].wrapping_add(u8::try_from(op.operand).unwrap());
-                    ip += 1;
+                    self.memory[self.head] = self.memory[self.head].wrapping_add(
+                        u8::try_from(op.operand).map_err(|_| {
+                            BfError::Runtime(format!(
+                                "INC operand conversion failed: {}",
+                                op.operand
+                            ))
+                        })?,
+                    );
+
+                    ip + 1
                 }
                 OpKind::Dec => {
                     // Decrement the current memory cell, with wrapping arithmetic
-                    self.memory[self.head] =
-                        self.memory[self.head].wrapping_sub(u8::try_from(op.operand).unwrap());
-                    ip += 1;
+                    self.memory[self.head] = self.memory[self.head].wrapping_sub(
+                        u8::try_from(op.operand).map_err(|_| {
+                            BfError::Runtime(format!(
+                                "DEC operand conversion failed: {}",
+                                op.operand
+                            ))
+                        })?,
+                    );
+
+                    ip + 1
                 }
                 OpKind::Left => {
                     // Move data pointer left, check for underflow
                     if self.head < op.operand {
-                        return Err(BfError::Runtime("Memory underflow".to_string()));
+                        return Err(BfError::Runtime("Memory underflow".into()));
                     }
                     self.head -= op.operand;
-                    ip += 1;
+
+                    ip + 1
                 }
                 OpKind::Right => {
                     // Move data pointer right, extend memory if needed
                     self.head += op.operand;
-                    while self.head >= self.memory.len() {
-                        self.memory.push(0);
+                    if self.head >= self.memory.len() {
+                        self.memory.resize(self.head + 1, 0);
                     }
-                    ip += 1;
+
+                    ip + 1
                 }
                 OpKind::Input => {
                     // Read bytes from stdin
@@ -249,30 +264,32 @@ impl Interpreter {
                         stdin.lock().read_exact(&mut input)?;
                         self.memory[self.head] = input[0];
                     }
-                    ip += 1;
+
+                    ip + 1
                 }
                 OpKind::Output => {
                     // Write bytes to stdout
                     for _ in 0..op.operand {
                         stdout_lock.write_all(&[self.memory[self.head]])?;
                     }
-                    ip += 1;
+
+                    ip + 1
                 }
                 OpKind::JumpIfZero => {
                     // Jump forward if current cell is zero
-                    ip = if self.memory[self.head] == 0 {
+                    if self.memory[self.head] == 0 {
                         op.operand
                     } else {
                         ip + 1
-                    };
+                    }
                 }
                 OpKind::JumpIfNonZero => {
                     // Jump backward if current cell is non-zero
-                    ip = if self.memory[self.head] == 0 {
+                    if self.memory[self.head] == 0 {
                         ip + 1
                     } else {
                         op.operand
-                    };
+                    }
                 }
             }
         }
@@ -294,18 +311,20 @@ pub struct JitCode {
 }
 
 impl JitCode {
-    /// Executes the JIT-compiled code with the given memory pointer
-    ///
-    /// # Safety
-    /// The caller must ensure that `memory_ptr` points to valid, writable memory
-    /// of sufficient size for the Brainf*ck program's execution.
+    /// Executes the JIT-compiled Brainf*ck program.
     ///
     /// # Arguments
-    /// * `memory_ptr` - Pointer to the Brainf*ck memory tape
-    pub unsafe fn execute(&self, memory_ptr: *mut u8) {
-        unsafe {
-            (self.run)(memory_ptr);
-        }
+    /// * `memory` - The Brainf*ck memory tape. The compiled program will
+    ///   read from and write to this buffer directly.
+    ///
+    /// # Safety
+    /// This method is safe to call. Internally it uses unsafe code to
+    /// jump into JIT-compiled machine code, but as long as `memory`
+    /// is a valid, mutable slice (which Rust guarantees), no additional
+    /// invariants are required from the caller.
+    pub fn execute(&self, memory: &mut [u8]) {
+        let ptr = memory.as_mut_ptr();
+        unsafe { (self.run)(ptr) }
     }
 }
 
@@ -347,11 +366,9 @@ impl JitCompiler {
         instruction_addresses.push(code_buffer.len());
 
         // Resolve jump addresses
-        Self::apply_backpatches(&mut code_buffer, &backpatches, &instruction_addresses);
-
+        let _ = Self::apply_backpatches(&mut code_buffer, &backpatches, &instruction_addresses);
         // Add return instruction
         code_buffer.push(0xC3); // RET
-
         let executable_memory = Self::allocate_executable_memory(&code_buffer)?;
 
         Ok(JitCode {
@@ -377,28 +394,44 @@ impl JitCompiler {
             OpKind::Inc => {
                 // ADD BYTE PTR [rdi], operand
                 if op.operand >= 256 {
-                    return Err(BfError::Jit("Operand too large for INC".to_string()));
+                    return Err(BfError::Jit("Operand too large for INC".into()));
                 }
+
                 buffer.extend_from_slice(&[0x80, 0x07]);
-                buffer.push(u8::try_from(op.operand).unwrap());
+                buffer.push(u8::try_from(op.operand).map_err(|_| {
+                    BfError::Jit(format!("Failed to convert INC operand: {}", op.operand))
+                })?);
             }
             OpKind::Dec => {
                 // SUB BYTE PTR [rdi], operand
                 if op.operand >= 256 {
-                    return Err(BfError::Jit("Operand too large for DEC".to_string()));
+                    return Err(BfError::Jit("Operand too large for DEC".into()));
                 }
+
                 buffer.extend_from_slice(&[0x80, 0x2F]);
-                buffer.push(u8::try_from(op.operand).unwrap());
+                buffer.push(u8::try_from(op.operand).map_err(|_| {
+                    BfError::Jit(format!("Failed to convert DEC operand: {}", op.operand))
+                })?);
             }
             OpKind::Left => {
                 // SUB rdi, operand (move pointer left)
                 buffer.extend_from_slice(&[0x48, 0x81, 0xEF]);
-                buffer.extend_from_slice(&(u32::try_from(op.operand).unwrap()).to_le_bytes());
+                buffer.extend_from_slice(
+                    &(u32::try_from(op.operand).map_err(|_| {
+                        BfError::Jit(format!("LEFT operand too large: {}", op.operand))
+                    })?)
+                    .to_le_bytes(),
+                );
             }
             OpKind::Right => {
                 // ADD rdi, operand (move pointer right)
                 buffer.extend_from_slice(&[0x48, 0x81, 0xC7]);
-                buffer.extend_from_slice(&(u32::try_from(op.operand).unwrap()).to_le_bytes());
+                buffer.extend_from_slice(
+                    &(u32::try_from(op.operand).map_err(|_| {
+                        BfError::Jit(format!("LEFT operand too large: {}", op.operand))
+                    })?)
+                    .to_le_bytes(),
+                );
             }
             OpKind::Output => {
                 // Emit system call for each output operation
@@ -466,13 +499,28 @@ impl JitCompiler {
         buffer: &mut [u8],
         backpatches: &[Backpatch],
         instruction_addresses: &[usize],
-    ) {
+    ) -> Result<(), BfError> {
         for bp in backpatches {
-            let src_addr = i32::try_from(bp.src_addr).unwrap();
-            let target_addr = i32::try_from(instruction_addresses[bp.target_idx]).unwrap();
+            let src_addr = i32::try_from(bp.src_addr).map_err(|_| {
+                BfError::Jit(format!(
+                    "Jump src address out of range for backpatch: {}",
+                    bp.src_addr
+                ))
+            })?;
+
+            let target_addr =
+                i32::try_from(instruction_addresses[bp.target_idx]).map_err(|_| {
+                    BfError::Jit(format!(
+                        "Jump target address out of range for backpatch: {}",
+                        instruction_addresses[bp.target_idx]
+                    ))
+                })?;
+
             let offset = target_addr - src_addr;
             buffer[bp.operand_addr..bp.operand_addr + 4].copy_from_slice(&offset.to_le_bytes());
         }
+
+        Ok(())
     }
 
     /// Allocates executable memory and copies the generated code into it
@@ -583,6 +631,7 @@ impl Parser {
                     kind: OpKind::JumpIfZero,
                     operand: 0, // Will be patched when matching ']' is found
                 });
+
                 loop_stack.push(addr);
             } else if c == b']' {
                 // End of loop - patch the matching '[' instruction
@@ -591,16 +640,16 @@ impl Parser {
                         kind: OpKind::JumpIfNonZero,
                         operand: start_addr,
                     });
+
                     ops[start_addr].operand = ops.len();
                 } else {
                     return Err(BfError::Parse {
                         file: source_name,
                         pos: lexer.position(),
-                        message: "Unmatched closing bracket".to_string(),
+                        message: "Unmatched closing bracket".into(),
                     });
                 }
             }
-            // All other characters are treated as comments and ignored
         }
 
         // Check for unmatched opening brackets
@@ -608,7 +657,7 @@ impl Parser {
             return Err(BfError::Parse {
                 file: source_name,
                 pos: lexer.position(),
-                message: "Unmatched opening bracket".to_string(),
+                message: "Unmatched opening bracket".into(),
             });
         }
 

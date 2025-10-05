@@ -94,9 +94,7 @@ fn run() -> Result<(), jit::BfError> {
 fn execute_jit(file_path: String) -> Result<(), jit::BfError> {
     let code = jit::jit_compile_file(file_path)?;
     let mut memory = vec![0u8; jit::JIT_MEMORY_CAP];
-    unsafe {
-        code.execute(memory.as_mut_ptr());
-    }
+    code.execute(&mut memory);
 
     Ok(())
 }
@@ -213,7 +211,7 @@ mod tests {
         let result = parse_args("bfjit", &["hello.bf".to_string(), "--no-jit".to_string()]);
         assert!(result.is_ok());
         let (no_jit, file_path) = result.unwrap();
-        assert_eq!(no_jit, true);
+        assert!(no_jit);
         assert_eq!(file_path, "hello.bf");
     }
 }
